@@ -1,0 +1,1065 @@
+# [source: 280]
+import os
+import logging
+import threading
+import smtplib
+import json
+import time
+# import jwt # Note: jwt is imported but not used in the provided core logic. Keep if needed elsewhere.
+import base64
+import urllib3
+import sys # Added for explicit path debugging if needed
+
+from flask import Flask, request, jsonify
+from datetime import datetime
+from langchain_google_genai import ChatGoogleGenerativeAI
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from asgiref.wsgi import WsgiToAsgi
+from dotenv import load_dotenv
+import requests
+# Note: Cryptography imports are present but not used in the core bot logic shown. Remove if unused.
+# from cryptography.hazmat.primitives.asymmetric import rsa
+# from cryptography.hazmat.primitives.asymmetric import padding
+# from cryptography.hazmat.primitives import hashes, serialization
+
+
+# Suppress InsecureRequestWarning when verify=False is used with requests
+# WARNING: Disabling SSL verification is a security risk. Remove verify=False where possible.
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Configure logging
+# Use standard Python logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)] # Ensure logs go to stdout for Render
+)
+logger = logging.getLogger(__name__)
+
+# Log Python path for debugging import issues if they arise later
+logger.info(f"Python sys.path: {sys.path}")
+
+
+app = Flask(__name__)
+
+# Global dictionary for ticket responses (primarily for internal state/logging now)
+ticket_responses = {}
+
+# --- Configuration from Environment Variables ---
+# IMPORTANT: Store sensitive values like passwords and API tokens securely
+# using environment variables (.env file locally, platform environment variables in deployment).
+# Do NOT hardcode them in the script.
+
+# Microsoft Teams Bot Credentials
+MICROSOFT_APP_ID = os.getenv("MICROSOFT_APP_ID")
+MICROSOFT_APP_PASSWORD = os.getenv("MICROSOFT_APP_PASSWORD")
+# Ensure the tenant ID is correct in the token URL if needed, or use 'common' for multi-tenant
+MICROSOFT_TENANT_ID = os.getenv("MICROSOFT_TENANT_ID", "common") # Or your specific tenant ID
+
+# Google Gemini API Key
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+# Jira Configuration (Using Basic Auth with Email and API Token)
+JIRA_BASE_URL = os.getenv('JIRA_BASE_URL')  # e.g., 'https://your-domain.atlassian.net'
+JIRA_USER_EMAIL = os.getenv('JIRA_USER_EMAIL') # Your Jira account email
+JIRA_API_TOKEN = os.getenv('JIRA_API_TOKEN') # Your Jira API Token (NOT your password)
+
+# Email Notification Settings
+EMAIL_SETTINGS = {
+    "SMTP_SERVER": os.getenv("SMTP_SERVER"),
+    "SMTP_PORT": int(os.getenv("SMTP_PORT", 587)), # Default to 587 for TLS
+    "SENDER_EMAIL": os.getenv("SENDER_EMAIL"),
+    "SENDER_PASSWORD": os.getenv("SENDER_PASSWORD") # Consider using app-specific passwords if available
+}
+
+# Department to Email Routing
+# Ensure these email addresses are valid
+CATEGORIES = {
+    "TRAINING": os.getenv("EMAIL_TRAINING", "training@example.com"),
+    "IT OPERATIONS": os.getenv("EMAIL_IT_OPERATIONS", "512superfast@gmail.com"), # Example: Use specific address
+    "TECHNOLOGY": os.getenv("EMAIL_TECHNOLOGY", "512superfast@gmail.com"), # Example: Use specific address
+    "HR": os.getenv("EMAIL_HR", "hr@example.com"),
+    "FINANCE": os.getenv("EMAIL_FINANCE", "finance@example.com"),
+    "SALES": os.getenv("EMAIL_SALES", "sales@example.com"),
+    "DEFAULT_EMAIL": os.getenv("EMAIL_DEFAULT", EMAIL_SETTINGS["SENDER_EMAIL"]) # Fallback email
+}
+
+# Department to Jira Project/Issue Type Mapping
+# IMPORTANT: Ensure these project keys and issue type names EXACTLY match your Jira setup.
+JIRA_DEPARTMENT_MAPPING = {
+    "TRAINING": {
+        "project_key": os.getenv("JIRA_PROJECT_TRAINING", "TRN"),
+        "issue_type": os.getenv("JIRA_ISSUETYPE_TRAINING", "Task")
+    },
+    "IT OPERATIONS": {
+        "project_key": os.getenv("JIRA_PROJECT_IT", "SUP"), # Example project key
+        "issue_type": os.getenv("JIRA_ISSUETYPE_IT", "Task") # Example issue type
+    },
+    "TECHNOLOGY": {
+        "project_key": os.getenv("JIRA_PROJECT_TECH", "TECH"),
+        "issue_type": os.getenv("JIRA_ISSUETYPE_TECH", "Task")
+    },
+    "HR":
+    { #
+        "project_key": os.getenv("JIRA_PROJECT_HR", "HR"),
+        "issue_type": os.getenv("JIRA_ISSUETYPE_HR", "Task")
+    },
+    "FINANCE": {
+        "project_key": os.getenv("JIRA_PROJECT_FINANCE", "FIN"),
+        "issue_type": os.getenv("JIRA_ISSUETYPE_FINANCE", "Task")
+    },
+    "SALES": {
+        "project_key": os.getenv("JIRA_PROJECT_SALES", "SALES"),
+        "issue_type": os.getenv("JIRA_ISSUETYPE_SALES", "Task")
+    },
+    # Default mapping if category doesn't match or is missing
+    "DEFAULT":
+    { #
+        "project_key": os.getenv("JIRA_PROJECT_DEFAULT", "SUP"), # Default project
+        "issue_type": os.getenv("JIRA_ISSUETYPE_DEFAULT", "Task") # Default issue type
+    }
+}
+
+# --- Jira Helper Functions (Using Basic Auth) ---
+
+def get_jira_auth_header():
+    """Constructs the Basic Authentication header for Jira."""
+    if not JIRA_USER_EMAIL or not JIRA_API_TOKEN:
+        logger.error("Jira User Email or API Token is missing in environment variables for Basic Auth.")
+        return None
+    # Encode email:api_token in Base64
+    credentials = f"{JIRA_USER_EMAIL}:{JIRA_API_TOKEN}"
+    encoded_credentials = base64.b64encode(credentials.encode()).decode()
+    return f"Basic {encoded_credentials}"
+
+def test_jira_connection():
+    """Test the Jira connection and permissions using Basic Auth. Includes improved logging."""
+    logger.info("Attempting Jira connection test (Basic Auth)...")
+    if not JIRA_BASE_URL:
+        logger.error("Jira Base URL is missing in environment variables.")
+        return False, []
+
+    auth_header = get_jira_auth_header()
+    if not auth_header:
+        return False, [] # Error already logged in get_jira_auth_header
+
+    try:
+        headers = {
+            "Authorization": auth_header,
+            "Accept": "application/json"
+        } #
+        # Ensure no double slash and use the correct API version (v3 is common for Cloud)
+        test_url = f"{JIRA_BASE_URL.rstrip('/')}/rest/api/3/project"
+        logger.info(f"Testing Jira connection to URL: {test_url}")
+
+        # WARNING: verify=False disables SSL cert verification. Remove if possible.
+        response = requests.get(test_url, headers=headers, verify=False, timeout=15) # Added timeout
+
+        logger.info(f"Jira connection test response status: {response.status_code}")
+
+        if response.status_code == 200: #
+            try:
+                projects = response.json()
+                # Ensure projects is a list and handle potential parsing issues
+                if isinstance(projects, list): #
+                    project_keys = [p.get('key') for p in projects if p and isinstance(p, dict) and p.get('key')] #
+                else:
+                     logger.warning(f"Jira API returned unexpected data type for projects: {type(projects)}")
+                     project_keys = []
+
+                logger.info(f"Jira connection successful. Available projects (first 10): {project_keys[:10]}") # Log only first few
+
+                # Validate our project mappings against accessible projects
+                valid_keys_found = []
+                missing_or_inaccessible_keys = []
+                configured_keys = set()
+
+                for dept, config in JIRA_DEPARTMENT_MAPPING.items(): #
+                     if isinstance(config, dict) and 'project_key' in config:
+                          proj_key = config['project_key']
+                          configured_keys.add(proj_key)
+                          if proj_key in project_keys: #
+                               valid_keys_found.append(proj_key)
+                          else:
+                              missing_or_inaccessible_keys.append(proj_key) #
+                     else:
+                          logger.warning(f"Invalid or missing 'project_key' in JIRA_DEPARTMENT_MAPPING for department: {dept}")
+
+                if missing_or_inaccessible_keys:
+                     logger.warning(f"Configured project keys NOT found or accessible via API token: {missing_or_inaccessible_keys}") #
+                if not valid_keys_found and configured_keys:
+                     logger.error(f"CRITICAL: None of the configured Jira project keys were found or are accessible by the API token: {list(configured_keys)}")
+                     # Depending on requirements, you might want to return False if no projects are valid
+                     # return False, project_keys
+                elif valid_keys_found:
+                     logger.info(f"Successfully validated access to configured project keys: {list(set(valid_keys_found))}")
+
+                return True, project_keys
+            except json.JSONDecodeError: #
+                logger.error(f"Jira connection test failed: Received status 200 but couldn't decode JSON response.")
+                logger.error(f"Response text: {response.text[:500]}") # Log first 500 chars of text
+                return False, []
+            except Exception as e: #
+                 logger.exception(f"Error processing successful Jira response: {e}")
+                 return False, []
+        else:
+            # Log more details on failure
+            error_text = response.text # Get the raw response text
+            logger.error(f"Jira connection test failed: Status {response.status_code}")
+            logger.error(f"Jira Response URL: {response.url}") # Log the final URL hit
+            logger.error(f"Jira Response Headers: {response.headers}") # Log response headers
+            logger.error(f"Jira Response Body: {error_text[:1000]}") # Log first 1000 chars of error body
+            return False, []
+
+    except requests.exceptions.Timeout:
+        logger.error(f"Error testing Jira connection: Request timed out after 15 seconds. Check JIRA_BASE_URL and network.") #
+        return False, []
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error testing Jira connection (RequestException): {str(e)}. Check JIRA_BASE_URL, network, and token validity.") #
+        return False, []
+    except Exception as e:
+        # Catch-all for unexpected errors during the test
+        logger.exception(f"Unexpected error testing Jira connection: {e}") # Use exception to log traceback
+        return False, []
+
+
+def create_jira_ticket(description, department, user_name, extracted_data=None):
+    """
+    Create a ticket in Jira using the REST API v3 with Basic Auth, dynamic fields, and ADF description.
+    Args:
+        description (str): Full user message / ticket description.
+        department (str): Department key (e.g., "IT OPERATIONS") for project/issue type mapping.
+        user_name (str): Name of the user submitting the request.
+        extracted_data (dict, optional): Additional structured data extracted by AI
+        (e.g., {'urgency': 'High', 'system': 'SAP'}). Defaults to None.
+    Returns:
+        dict: Contains ticket creation status ('success' or 'error'), 'ticket_id',
+        'project', 'url', and 'message' on error.
+    """
+    logger.info(f"Initiating Jira ticket creation for department: {department}")
+    if not JIRA_BASE_URL:
+        logger.error("Cannot create Jira ticket: Jira Base URL is missing.")
+        return {"status": "error", "message": "Missing Jira base URL configuration"}
+
+    auth_header = get_jira_auth_header()
+    if not auth_header:
+        return {"status": "error", "message": "Missing Jira Email or API Token for Basic Auth"}
+
+    if not extracted_data:
+        extracted_data = {}
+
+    try:
+        # Determine Project Key and Issue Type Name from mapping
+        dept_upper = department.upper() # Ensure consistent casing
+        dept_config = JIRA_DEPARTMENT_MAPPING.get(dept_upper, JIRA_DEPARTMENT_MAPPING.get('DEFAULT'))
+
+        if not dept_config or not isinstance(dept_config, dict) or 'project_key' not in dept_config or 'issue_type' not in dept_config:
+            logger.error(f"Invalid or incomplete Jira mapping for department '{dept_upper}' or DEFAULT in JIRA_DEPARTMENT_MAPPING.")
+            # Fallback to DEFAULT explicitly if the specific department config is bad
+            if dept_upper != 'DEFAULT': #
+                 dept_config = JIRA_DEPARTMENT_MAPPING.get('DEFAULT')
+                 if not dept_config or 'project_key' not in dept_config or 'issue_type' not in dept_config:
+                      logger.error("DEFAULT Jira mapping is also invalid or missing.")
+                      return {"status": "error", "message": f"Configuration error: Invalid Jira mapping for '{dept_upper}' and DEFAULT."} #
+                 else:
+                      logger.warning(f"Falling back to DEFAULT Jira mapping for department '{dept_upper}'.")
+            else:
+                return {"status": "error", "message": f"Configuration error: Invalid DEFAULT Jira mapping."}
+
+        project_key = dept_config['project_key'] #
+        issue_type_name = dept_config['issue_type'] # Use the name
+
+        logger.info(f"Targeting Jira Project: {project_key}, Issue Type: {issue_type_name}")
+
+        # --- Construct the 'fields' payload for the Jira API ---
+        jira_fields = {
+            "project": {"key": project_key},
+            "issuetype": {"name": issue_type_name}, # Reference issue type by name
+            "summary": extracted_data.get("summary_suggestion", f"Teams Bot Request from {user_name}: {description[:70]}..."), # Use AI summary or truncate description
+            # Use Atlassian Document Format (ADF) for richer description formatting
+            "description": {
+                "type": "doc",
+                "version": 1,
+                "content": [ #
+                    {
+                        "type": "paragraph",
+                        "content": [{"type": "text", "text": f"Request submitted via Microsoft Teams Bot."}]
+                     }, #
+                    {   "type": "rule" }, # Horizontal line
+                    {
+                        "type": "paragraph",
+                        "content": [ #
+                            {"type": "text", "text": "Submitter: ", "marks": [{"type": "strong"}]},
+                            {"type": "text", "text": user_name}
+                        ]
+                     }, #
+                    {
+                        "type": "paragraph",
+                        "content": [ #
+                             {"type": "text", "text": "Detected Department: ", "marks": [{"type": "strong"}]},
+                            {"type": "text", "text": department} # Use the original detected department name
+                        ]
+                    }, #
+                     {
+                        "type": "heading", "attrs": {"level": 3},
+                        "content": [{"type": "text", "text": "User's Message"}]
+                    },
+                    { #
+                        "type": "paragraph",
+                        "content": [{"type": "text", "text": description}] # The full original message
+                    }
+                    # You can add more ADF elements here based on extracted_data if needed
+                    # Example: Add extracted system if present
+                    # {
+                    #     "type": "paragraph", #
+                    #     "content": [
+                    #         {"type": "text", "text": "System Mentioned: ", "marks": [{"type": "strong"}]},
+                    #         {"type": "text", "text": extracted_data.get('system', 'N/A')}
+                     #     ] #
+                    # } if 'system' in extracted_data else None # Conditional element
+                ]
+                # Filter out None elements if using conditionals like above
+                 # "content": [elem for elem in [...] if elem is not None]
+            },
+            "labels": ["Teams-Bot-Ticket", department.lower().replace(" ", "-")] #
+        }
+
+        # --- Add Optional/Dynamic Fields based on extracted_data ---
+
+        # Example: Map extracted 'urgency' to Jira 'priority' field (by Name)
+        # IMPORTANT: Replace 'Highest'/'High' etc. with the EXACT names of priorities in YOUR Jira instance.
+        urgency = extracted_data.get("urgency") #
+        if urgency:
+            priority_map = {
+                "Highest": "Highest", "High": "High",
+                "Medium": "Medium", "Low": "Low"
+                # Add your specific priority names here
+            }
+            jira_priority_name = priority_map.get(urgency) #
+            if jira_priority_name:
+                jira_fields["priority"] = {"name": jira_priority_name}
+                logger.info(f"Setting Jira priority to: {jira_priority_name}")
+            else:
+                 logger.warning(f"Urgency value '{urgency}' from AI does not map to a known Jira priority name.") #
+
+        # Example: Add 'system_mentioned' as a Jira Component (by Name)
+        # NOTE: Jira might error if the component name doesn't exist and project settings don't allow auto-creation.
+        system = extracted_data.get("system_mentioned") #
+        if system:
+            jira_fields["components"] = [{"name": system}]
+            logger.info(f"Adding Jira component: {system}")
+            # Optionally add system as a label too
+            jira_fields["labels"].append(system.lower().replace(" ", "-").replace("_","-")[:255]) # Max label length
+
+        # Example: Populate a Custom Field (replace 'customfield_10010' with YOUR field ID) #
+         # Check Jira API ('/rest/api/3/field') or inspect element in browser to find field IDs.
+        # Format depends on the custom field type (text, number, select list, user picker etc.)
+        # custom_field_id_example = 'customfield_10010' # <--- REPLACE THIS
+        # if 'some_specific_data' in extracted_data:
+        #     # Example for a simple text custom field:
+        #     # jira_fields[custom_field_id_example] = str(extracted_data['some_specific_data'])
+        #     # Example for a single-select list custom field (by value/name): #
+        #     # jira_fields[custom_field_id_example] = {"value": extracted_data['some_specific_data']}
+        #     # Example for a number custom field:
+        #     # try:
+        #     #    jira_fields[custom_field_id_example] = float(extracted_data['some_specific_data'])
+        #     # except ValueError:
+        #     #    logger.warning(f"Could not convert extracted data to number for {custom_field_id_example}") #
+        #     logger.info(f"Setting custom field {custom_field_id_example}")
+
+        # --- End of Dynamic Fields ---
+
+        # Final payload structure
+        ticket_payload = {"fields": jira_fields}
+
+        # API endpoint for creating an issue
+        create_issue_url = f"{JIRA_BASE_URL.rstrip('/')}/rest/api/3/issue"
+
+        headers = {
+             "Authorization": auth_header, # Using Basic Auth header
+            "Accept": "application/json",
+            "Content-Type": "application/json"
+        }
+
+        logger.info(f"Sending Jira create issue request to: {create_issue_url}")
+        # Avoid logging the full payload in production if it contains sensitive info
+        # logger.debug(f"Jira request payload: {json.dumps(ticket_payload)}")
+
+        # --- Consider adding retry logic here ---
+        # Example using tenacity (install with `pip install tenacity`):
+        # from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
+        # @retry(stop=stop_after_attempt(3), wait=wait_fixed(2),
+        #        retry=retry_if_exception_type(requests.exceptions.RequestException))
+        # def post_to_jira():
+        #     return requests.post(...)
+        # response = post_to_jira()
+
+        response = requests.post( #
+             create_issue_url,
+            headers=headers,
+            json=ticket_payload,
+            # WARNING: verify=False disables SSL cert verification. Remove if possible.
+            verify=False,
+            timeout=30 # Slightly longer timeout for creation operations
+        )
+
+        # Check response status code (201 Created is success)
+        if response.status_code == 201:
+            issue_data = response.json()
+            ticket_key = issue_data.get('key')
+            ticket_url = f"{JIRA_BASE_URL.rstrip('/')}/browse/{ticket_key}" if ticket_key else "N/A" #
+            logger.info(f"Successfully created Jira ticket: {ticket_key} in project {project_key}")
+            return {
+                "status": "success",
+                "ticket_id": ticket_key,
+                "project": project_key,
+                 "url": ticket_url #
+            }
+        # <<< Start of the ELSE block handling non-201 responses >>>
+        else:
+            # --- SIMPLIFIED ERROR HANDLING (as per previous fix) ---
+            error_message = f"Jira API Error - Status: {response.status_code}" # Line 419 is now here
+            raw_response_text = response.text[:1000] # Limit logged text
+            error_message += f" | Response: {raw_response_text}"
+
+            logger.error(f"Jira Ticket Creation Failed: {error_message}")
+            # --- END OF SIMPLIFIED ERROR HANDLING ---
+
+            # Return error status - this is still inside the main 'else' block
+            return {
+                "status": "error",
+                "message": error_message # Provide the simplified error message
+            }
+        # <<< End of the ELSE block handling non-201 responses >>>
+
+    # Except blocks for the outer 'try' (network errors, timeouts, etc.)
+    except requests.exceptions.Timeout:
+         logger.error(f"Jira Ticket Creation Failed: Request timed out after 30 seconds.")
+         return {"status": "error", "message": "Request to Jira timed out"}
+    except requests.exceptions.RequestException as req_err:
+        logger.error(f"Jira Ticket Creation Failed (RequestException): {req_err}")
+        return {"status": "error", "message": f"Network or connection error to Jira: {str(req_err)}"}
+    except Exception as e:
+        # Catch potential errors during payload building or other unexpected issues
+        logger.exception(f"Unexpected Error during Jira Ticket Creation: {e}") # Logs traceback
+        return {"status": "error", "message": f"An unexpected error occurred: {str(e)}"}
+
+# --- Microsoft Teams Bot Authentication and Communication ---
+
+def get_auth_token():
+    """Get authentication token for Microsoft Bot Framework API."""
+    if not MICROSOFT_APP_ID or not MICROSOFT_APP_PASSWORD:
+        logger.error("Missing Microsoft App ID or App Password in environment variables.")
+        return None
+
+    # Use tenant ID from environment or default ('common' allows multi-tenant)
+    # Ensure this tenant ID matches where your application is registered in Azure AD.
+    token_url = f"https://login.microsoftonline.com/{MICROSOFT_TENANT_ID}/oauth2/v2.0/token" #
+    # token_url = "https://login.microsoftonline.com/botframework.com/oauth2/v2.0/token" # Alternative endpoint if needed
+
+    data = {
+        "grant_type": "client_credentials",
+        "client_id": MICROSOFT_APP_ID,
+        "client_secret": MICROSOFT_APP_PASSWORD,
+        "scope": "https://api.botframework.com/.default" # Standard scope for Bot Framework API
+    }
+
+    try:
+        logger.info(f"Requesting Bot Framework auth token from {token_url} with client ID: {MICROSOFT_APP_ID[:5]}...")
+        response = requests.post(token_url, data=data, timeout=10)
+        response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
+
+        response_data = response.json()
+        token = response_data.get("access_token")
+
+        if not token:
+            logger.error("Auth token request successful, but no 'access_token' found in response.")
+            return None
+
+        logger.info(f"Successfully obtained Bot Framework auth token (type: {response_data.get('token_type')}).")
+        return token #
+
+    except requests.exceptions.Timeout:
+         logger.error("Auth token request timed out.")
+         return None
+    except requests.exceptions.HTTPError as http_err:
+         # Log the specific error from the response text for easier debugging
+         error_text = http_err.response.text
+         logger.error(f"Auth token request failed (HTTPError): {http_err.response.status_code} - {error_text}")
+         # Check for the specific AADSTS error mentioned by the user
+         if "AADSTS700016" in error_text:
+              logger.error("-> This 'AADSTS700016' error indicates the Application ID was not found or not consented in the tenant.")
+              logger.error("-> Verify MICROSOFT_APP_ID, MICROSOFT_TENANT_ID, and App Registration/Consent status in Azure AD.")
+         elif http_err.response.status_code == 401 or "invalid_client" in error_text:
+              logger.error("-> This suggests the MICROSOFT_APP_PASSWORD (client secret) might be incorrect or expired.")
+
+         return None
+    except requests.exceptions.RequestException as req_err:
+         logger.error(f"Auth token request failed (RequestException): {str(req_err)}")
+         return None
+    except Exception as e: #
+        logger.exception(f"Unexpected error getting Bot Framework auth token: {e}")
+        return None
+
+def send_teams_response(activity, response_payload):
+    """
+    Send a response message back to the Teams conversation using the Bot Framework API.
+    Args:
+        activity (dict): The incoming activity object from Teams (contains conversation details).
+        response_payload (dict): The payload for the message to send (e.g., simple text or Adaptive Card).
+    Returns:
+        bool: True if the message was sent successfully (status 2xx), False otherwise.
+    """
+    try:
+        service_url = activity.get('serviceUrl')
+        conversation_id = activity.get('conversation', {}).get('id')
+        activity_id = activity.get('id') # ID of the message being replied to
+
+        if not service_url or not conversation_id:
+            logger.error("Cannot send Teams response: Missing 'serviceUrl' or 'conversation.id' in incoming activity.")
+            logger.debug(f"Activity dump: {json.dumps(activity)}")
+            return False #
+
+        # Construct the URL for sending a new message to the conversation
+        # Replying directly can sometimes be complex; sending a new message is often simpler.
+        response_url = f"{service_url.rstrip('/')}/v3/conversations/{conversation_id}/activities"
+
+        auth_token = get_auth_token()
+        if not auth_token: #
+            logger.error("Failed to get auth token, cannot send response to Teams.")
+            return False
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {auth_token}"
+        }
+
+        # Ensure the response payload has necessary fields expected by Bot Framework
+        # Make sure 'from' and 'recipient' are correctly swapped from the incoming activity
+        response_payload['from'] = activity.get('recipient') # Bot is the sender
+        response_payload['recipient'] = activity.get('from') # User is the recipient
+        response_payload['conversation'] = activity.get('conversation')
+        # Set type if not already set (e.g., for simple text messages)
+        if 'type' not in response_payload:
+            response_payload['type'] = 'message'
+        # response_payload['replyToId'] = activity_id # Uncomment if you want to thread the reply explicitly
+
+        logger.info(f"Sending response to Teams URL: {response_url}")
+        # Avoid logging full payload in prod if sensitive
+        # logger.debug(f"Response payload: {json.dumps(response_payload)}")
+
+        # --- Consider adding retry logic here ---
+        # Example using tenacity:
+        # @retry(...)
+        # def post_to_teams():
+        #     return requests.post(response_url, json=response_payload, headers=headers, timeout=15)
+        # response = post_to_teams()
+
+        response = requests.post(response_url, json=response_payload, headers=headers, timeout=15) #
+
+        if 200 <= response.status_code < 300:
+            logger.info(f"Successfully sent response to Teams (Status: {response.status_code}). Response ID: {response.json().get('id', 'N/A')}") #
+            return True
+        else:
+            logger.error(f"Failed to send response to Teams: Status {response.status_code} - {response.text}")
+            return False
+
+    except requests.exceptions.Timeout:
+         logger.error("Error sending Teams response: Request timed out.")
+         return False
+    except requests.exceptions.RequestException as req_err: #
+         logger.error(f"Error sending Teams response (RequestException): {str(req_err)}")
+         return False
+    except Exception as e:
+        logger.exception(f"Unexpected error sending Teams response: {e}")
+        return False
+
+# --- Adaptive Card Helper ---
+
+def create_adaptive_card_response(title, description, ticket_id=None, department=None, jira_id=None, jira_url=None):
+    """Creates a structured Adaptive Card payload for Teams messages."""
+    card = {
+        "type": "AdaptiveCard",
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "version": "1.4", # Use a reasonably current version
+        "body": [
+            {
+                "type": "TextBlock",
+                "size": "Medium",
+                "weight": "Bolder",
+                "text": title,
+                "wrap": True #
+            },
+            {
+                "type": "TextBlock",
+                "text": description,
+                "wrap": True,
+                 "separator": True # Add a line separator
+            }
+        ]
+    }
+
+    # Add key details using a FactSet
+    facts = []
+    if ticket_id:
+        facts.append({"title": "Tracking ID:", "value": ticket_id})
+    if department:
+        facts.append({"title": "Department:", "value": department})
+    if jira_id:
+        facts.append({"title": "Jira Issue:", "value": jira_id}) #
+
+    if facts:
+        card["body"].append({
+            "type": "FactSet",
+            "facts": facts,
+            "separator": True
+        })
+
+    # Add action button to view in Jira if URL is available
+    if jira_url:
+        card["actions"] = [ #
+             {
+                "type": "Action.OpenUrl",
+                "title": "View in Jira",
+                "url": jira_url,
+                "style": "positive" # Optional styling
+            }
+        ]
+
+    # Return the structure expected by Bot Framework for attachments
+    return {
+        "type": "message",
+        "attachments": [
+            {
+                "contentType": "application/vnd.microsoft.card.adaptive",
+                "contentUrl": None, # Important: contentUrl should be null when content is provided
+                 "content": card #
+            }
+        ]
+    }
+
+
+# --- Command Handling Logic ---
+
+def handle_hi():
+    """Handles 'hi', 'hello', 'hey' commands."""
+    logger.info("Handling greeting command.")
+    return create_adaptive_card_response(
+        "Hello! 👋", #
+        "I'm your IT & Support Assistant bot. I can help create Jira tickets for your issues. How can I help you today?\n\nType 'help' for commands or just describe your problem." #
+    )
+
+def handle_help():
+    """Handles 'help' command."""
+    logger.info("Handling help command.")
+    return create_adaptive_card_response(
+        "How I Can Help",
+        "Here are the ways you can interact with me:\n" +
+        "• **Describe your issue:** Just tell me what's wrong (e.g., 'My laptop won't turn on', 'Need access to the shared drive'). I'll analyze it and create a Jira ticket.\n" + #
+        "• **`create ticket <description>`:** Explicitly ask me to create a ticket with your description.\n" +
+        "• **`hi` / `hello`:** Get a friendly greeting.\n" +
+        "• **`check status`:** Verify my connection status to essential services like Jira.\n" + #
+        "• **`help`:** Show this help message again."
+    )
+
+def handle_check_status():
+    """Handles 'check status' command by testing connections."""
+    logger.info("Handling check status command.") #
+    # Test Jira Connection
+    jira_ok, projects = test_jira_connection()
+    jira_status_text = f"✅ Connected (Found {len(projects)} projects)" if jira_ok else "❌ Connection Failed (Check logs)"
+
+    # Test Email Connection (optional - basic check)
+    email_ok = False
+    if all(EMAIL_SETTINGS.values()):
+         try:
+              # Quick check: try connecting without sending email
+              with smtplib.SMTP(EMAIL_SETTINGS['SMTP_SERVER'], EMAIL_SETTINGS['SMTP_PORT'], timeout=5) as server: #
+                   server.starttls() # Attempt TLS handshake
+                   # server.login(EMAIL_SETTINGS['SENDER_EMAIL'], EMAIL_SETTINGS['SENDER_PASSWORD']) # Don't login for just status check
+                   email_ok = True
+              email_status_text = "✅ Configured & Reachable"
+         except Exception as e: #
+              logger.warning(f"Email status check failed: {e}")
+              email_status_text = "⚠️ Configured but Unreachable/Error"
+    else:
+        email_status_text = "❌ Not Fully Configured"
+
+    # Test Bot Framework Auth Token
+    token = get_auth_token()
+    teams_api_status = "✅ Authentication OK" if token else "❌ Authentication Failed (Check Bot Credentials/Config)"
+
+    status_description = f"""
+* **Bot Operation:** ✅ Running
+* **Teams API:** {teams_api_status}
+* **Jira Connection:** {jira_status_text}
+* **Email Notifications:** {email_status_text}
+"""
+    return create_adaptive_card_response(
+        "System Status Check",
+        status_description
+    )
+
+# --- AI & Ticket Processing ---
+
+def get_department_from_gemini(description):
+    """
+    Uses Google Gemini to classify the issue description into a department category.
+    Args:
+        description (str): The user's issue description.
+    Returns:
+        tuple: (str: Detected Category (e.g., "IT OPERATIONS"), str: Reason for classification)
+               Returns ("IT OPERATIONS", "Default classification due to error") on failure.
+    """
+    logger.info(f"Classifying description for department using Gemini: '{description[:100]}...'")
+    if not GEMINI_API_KEY:
+        logger.warning("GEMINI_API_KEY not configured. Falling back to default department.")
+        return "IT OPERATIONS", "Default category: Gemini API key missing"
+
+    # Define the categories Gemini should choose from (keys of CATEGORIES dict)
+    valid_categories = list(CATEGORIES.keys())
+    if "DEFAULT_EMAIL" in valid_categories:
+        valid_categories.remove("DEFAULT_EMAIL") # Exclude default email key
+
+    # Improved prompt for better classification and reasoning
+    prompt_text = f"""
+Analyze the following user support request and classify it into ONE of the primary support categories listed below. Provide a brief justification for your choice.
+
+Categories: {', '.join(valid_categories)}
+
+Category Descriptions:
+- IT OPERATIONS: Hardware, software issues, system access, network problems, general computer support.
+- TECHNOLOGY: Technical project requests, software development issues, database questions, API support.
+- TRAINING: Requests for software training, skill development, documentation help.
+- HR: Payroll, benefits, leave requests, personnel issues.
+- FINANCE: Budget questions, expense reports, invoice inquiries.
+- SALES: CRM issues, sales process questions, customer data requests.
+
+User Request: "{description}"
+
+Respond ONLY in this format:
+Category: [CHOSEN CATEGORY]
+Reason: [Your brief justification based on the request]
+""" #
+
+    try:
+        # Initialize the Gemini model (consider making this a global instance if called frequently)
+        # Use a model suitable for classification, like gemini-1.5-pro or gemini-pro
+        model = ChatGoogleGenerativeAI(model="gemini-1.5-pro", api_key=GEMINI_API_KEY, temperature=0.2)
+
+        response = model.invoke(prompt_text)
+        content = response.content if hasattr(response, "content") else str(response)
+        logger.debug(f"Gemini raw response: {content}")
+
+        lines = content.strip().split('\n')
+        category_line = next((line for line in lines if line.strip().startswith('Category:')), None)
+        reason_line = next((line for line in lines if line.strip().startswith('Reason:')), None)
+
+        # Extract and validate the category
+        category = "IT OPERATIONS" # Default fallback
+        if category_line:
+            extracted_cat = category_line.replace('Category:', '').strip().upper()
+            # Check if the extracted category is one we actually handle
+            if extracted_cat in valid_categories:
+                category = extracted_cat
+            else:
+                logger.warning(f"Gemini returned category '{extracted_cat}' which is not in the configured list {valid_categories}. Falling back to IT OPERATIONS.") #
+        else:
+            logger.warning("Could not parse 'Category:' line from Gemini response. Falling back.")
+
+        # Extract the reason
+        reason = "Default classification" # Default fallback
+        if reason_line:
+            reason = reason_line.replace('Reason:', '').strip()
+        else:
+            logger.warning("Could not parse 'Reason:' line from Gemini response.")
+
+        # TODO: Enhance this section if you modify the prompt for structured data extraction
+        # Example: Parse JSON if Gemini returns it
+        # try:
+        # structured_data = json.loads(content)
+        # category = structured_data.get("category", "IT OPERATIONS").upper()
+        # reason = structured_data.get("reason", "AI classification")
+        # # Extract other fields: urgency = structured_data.get("urgency") etc.
+        # except json.JSONDecodeError:
+        # logger.error("Failed to parse JSON output from Gemini.") #
+        # # Fallback to text parsing or defaults
+
+        logger.info(f"Gemini classified issue into: {category}. Reason: {reason}")
+        return category, reason
+
+    except Exception as e:
+        logger.exception(f"Error during Gemini API call or processing: {e}")
+        return "IT OPERATIONS", f"Default category due to Gemini error: {str(e)[:100]}" # Provide snippet of error
+
+def send_notification(subject, body, to_email):
+    """Sends an email notification using configured SMTP settings."""
+    if not all([EMAIL_SETTINGS["SMTP_SERVER"], EMAIL_SETTINGS["SENDER_EMAIL"], EMAIL_SETTINGS["SENDER_PASSWORD"]]):
+        logger.warning(f"Email settings incomplete. Cannot send notification to {to_email}.") #
+        return False
+
+    logger.info(f"Attempting to send email notification to {to_email}. Subject: {subject}")
+    msg = MIMEMultipart()
+    msg['From'] = EMAIL_SETTINGS['SENDER_EMAIL']
+    msg['To'] = to_email
+    msg['Subject'] = subject
+    msg.attach(MIMEText(body, 'plain', 'utf-8')) # Use utf-8 encoding
+
+    try:
+        # Connect using SMTP_SSL for implicit SSL (port 465) or SMTP for STARTTLS (port 587)
+        # This logic might need adjustment based on your provider (e.g., Gmail uses 465 or 587)
+        smtp_port = EMAIL_SETTINGS['SMTP_PORT']
+        if smtp_port == 465:
+            server = smtplib.SMTP_SSL(EMAIL_SETTINGS['SMTP_SERVER'], smtp_port, timeout=15)
+        else: # Assume STARTTLS for port 587 or others
+            server = smtplib.SMTP(EMAIL_SETTINGS['SMTP_SERVER'], smtp_port, timeout=15)
+            server.starttls() # Secure the connection
+
+        server.login(EMAIL_SETTINGS['SENDER_EMAIL'], EMAIL_SETTINGS['SENDER_PASSWORD']) #
+        server.send_message(msg)
+        server.quit()
+        logger.info("Email notification sent successfully.")
+        return True
+    except smtplib.SMTPAuthenticationError:
+        logger.error(f"Email Error: SMTP Authentication failed for {EMAIL_SETTINGS['SENDER_EMAIL']}. Check password/credentials.") #
+        return False
+    except smtplib.SMTPServerDisconnected:
+        logger.error("Email Error: SMTP server disconnected unexpectedly.") #
+        return False
+    except smtplib.SMTPException as smtp_err:
+        logger.error(f"Email Error (SMTPException): {smtp_err}")
+        return False
+    except Exception as e:
+        logger.exception(f"Unexpected error sending email: {e}") # Log traceback
+        return False
+
+def process_ticket_async(user_message, user_name, teams_ticket_id, activity_details):
+    """
+    Asynchronously processes ticket creation: classifies, creates Jira ticket, sends email.
+    Note: Does NOT send a follow-up Teams message in this version. Details are in email.
+    Args:
+        user_message (str): The original message from the user.
+        user_name (str): The name of the user.
+        teams_ticket_id (str): The temporary tracking ID generated by the bot.
+        activity_details (dict): Key details from the original Teams activity needed for potential future use.
+                                Example: {'serviceUrl': ..., 'conversationId': ...}
+    """
+    global ticket_responses
+    start_time = time.time() #
+    logger.info(f"Starting async processing for ticket {teams_ticket_id}...")
+
+    # 1. Classify the issue using Gemini
+    department, classification_reason = get_department_from_gemini(user_message)
+
+    # 2. Get Target Email Address
+    target_email = CATEGORIES.get(department.upper(), CATEGORIES["DEFAULT_EMAIL"])
+    logger.info(f"Routing ticket {teams_ticket_id} to Department: {department}, Email: {target_email}")
+
+    # 3. Create Jira Ticket (passing department and user name)
+    # Consider passing more extracted data from Gemini if available/needed
+    jira_result = create_jira_ticket(user_message, department, user_name)
+    jira_ticket_id = "N/A"
+    jira_status_message = "Jira: N/A"
+    jira_creation_failed = True
+    jira_url = None # Initialize jira_url
+
+    if jira_result and jira_result.get("status") == "success":
+        jira_ticket_id = jira_result.get("ticket_id", "N/A")
+        jira_status_message = f"Jira Ticket: {jira_ticket_id}"
+        jira_url = jira_result.get("url") # Get URL for email/potential future Teams message
+        logger.info(f"Jira ticket created successfully for {teams_ticket_id}: {jira_ticket_id}")
+        jira_creation_failed = False
+    else:
+        error_msg = jira_result.get("message", "Unknown Jira error")
+        jira_status_message = f"Jira Creation Failed: {error_msg}"
+        logger.error(f"Jira ticket creation failed for {teams_ticket_id}: {error_msg}")
+
+    # 4. Send Email Notification
+    email_subject = f"Support Ticket {teams_ticket_id} ({department}) - {jira_status_message}"
+    email_body = f"""
+A new support request has been received and processed:
+
+Tracking ID: {teams_ticket_id}
+Submitted By: {user_name}
+Detected Department: {department}
+Classification Reason: {classification_reason}
+
+Jira Status: {jira_status_message}
+"""
+    if not jira_creation_failed and jira_url:
+        email_body += f"Jira URL: {jira_url}\n"
+    email_body += f"""
+User's Message:
+-----------------
+{user_message}
+-----------------
+
+Activity Details (for reference):
+{json.dumps(activity_details, indent=2)}
+"""
+    notified = send_notification(email_subject, email_body, target_email)
+
+    # 5. Log Final Status
+    end_time = time.time()
+    duration = round(end_time - start_time, 2)
+    final_status = f"Processed - Jira {'Failed' if jira_creation_failed else 'OK'}"
+    if jira_creation_failed:
+        logger.error(f"Ticket {teams_ticket_id} processed, but Jira creation failed: {jira_result.get('message', 'Unknown error')}. Notified: {notified}")
+    else:
+         logger.info(f"Ticket {teams_ticket_id} processed successfully (Jira: {jira_ticket_id}). Notified: {notified}")
+
+    logger.info(f"Finished async processing for ticket {teams_ticket_id} in {duration} seconds. Final status: {final_status}")
+
+    # Store result (optional, for potential future status checks via bot)
+    ticket_responses[teams_ticket_id] = {
+        "status": final_status,
+        "department": department,
+        "jira_id": jira_ticket_id if not jira_creation_failed else "Failed",
+        "notified": notified,
+        "timestamp": datetime.utcnow().isoformat() + "Z"
+    }
+    # NOTE: This version does NOT send a confirmation back to Teams after async processing.
+    # To add that, you would need to call send_teams_response here using activity_details.
+
+
+# --- Flask          Endpoint ---
+
+@app.route("/api/messages", methods=["POST"])
+def messages():
+    """Main endpoint for receiving messages from Microsoft Teams."""
+    # --- CORRECTED Content-Type Check ---
+    # Use request.mimetype which correctly handles parameters like charset
+    if request.mimetype == "application/json":
+        activity = request.json
+        logger.info(f"Received activity type: {activity.get('type')}")
+        # logger.debug(f"Full activity payload: {json.dumps(activity)}") # DEBUG only
+
+        # We are interested in 'message' type activities where text is present
+        if activity.get("type") == "message" and activity.get("text"):
+            user_message = activity['text'].strip()
+            user_name = activity.get('from', {}).get('name', 'Unknown User')
+            logger.info(f"Processing message from '{user_name}': '{user_message[:100]}...'")
+
+            # Normalize message for command checking
+            command_message = user_message.lower()
+
+            response_payload = None
+
+            # --- Basic Command Handling ---
+            if command_message in ['hi', 'hello', 'hey']:
+                response_payload = handle_hi()
+            elif command_message == 'help':
+                response_payload = handle_help()
+            elif command_message == 'check status':
+                response_payload = handle_check_status()
+            elif command_message.startswith('create ticket '):
+                 # Explicit ticket creation command
+                 description = user_message[len('create ticket '):].strip()
+                 if not description:
+                      response_payload = create_adaptive_card_response(
+                           "Missing Description",
+                           "Please provide a description after 'create ticket '."
+                      )
+                 else:
+                      user_message = description # Use the provided description for processing
+                      # Proceed to normal ticket processing below
+            # --- End Basic Command Handling ---
+
+
+            if response_payload:
+                 # Send immediate response for simple commands
+                 send_teams_response(activity, response_payload)
+                 return jsonify({"status": "Command handled"}), 200
+
+
+            # --- Default Action: Process as a Support Request ---
+            # Generate a temporary tracking ID
+            teams_ticket_id = f"TKT-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{user_name[:3].upper()}"
+            ticket_responses[teams_ticket_id] = {"status": "Received"} # Initial status
+
+            # Acknowledge receipt immediately to Teams (avoids timeout errors)
+            ack_payload = create_adaptive_card_response(
+                f"Processing Request: {teams_ticket_id}",
+                f"Thanks, {user_name}! I've received your request:\n\n*'{user_message[:150]}...'* \n\nI'm analyzing it now and will create a support ticket. Details will be sent via email."
+            )
+            if not send_teams_response(activity, ack_payload):
+                 logger.error(f"Failed to send initial acknowledgement for activity {activity.get('id')}.")
+                 # Continue processing anyway, but log the failure
+
+            # Extract necessary details for async processing and potential future replies
+            activity_details_for_async = {
+                'serviceUrl': activity.get('serviceUrl'),
+                'channelId': activity.get('channelId'),
+                'from': activity.get('from'), # User info
+                'recipient': activity.get('recipient'), # Bot info
+                'conversation': activity.get('conversation') # Conversation context
+            }
+
+            # Start background thread for AI classification, Jira creation, and email notification
+            thread = threading.Thread(target=process_ticket_async, args=(
+                user_message, user_name, teams_ticket_id, activity_details_for_async
+            ))
+            thread.daemon = True # Allow main thread to exit even if this thread is running
+            thread.start()
+
+            return jsonify({"status": "Processing started", "ticket_id": teams_ticket_id}), 202 # Accepted
+
+        elif activity.get("type") == "conversationUpdate":
+             # Handle bot being added or other conversation updates if needed
+             logger.info("Received conversationUpdate activity.")
+             # Example: Send welcome message when bot is added
+             # if activity.get('membersAdded'):
+             #     for member in activity['membersAdded']:
+             #         if member.get('id') == activity.get('recipient', {}).get('id'): # Bot was added
+             #             welcome_card = handle_hi() # Send standard greeting
+             #             # Need to construct reply payload carefully for conversationUpdate
+             #             # It might require using createOrGetDirectConversation API first
+             #             logger.info(f"Bot added to conversation: {activity.get('conversation',{}).get('id')}")
+             #             # send_teams_response(activity, welcome_card) # This might need adjustment
+
+        else:
+            # Ignore other activity types for now
+            logger.info(f"Ignoring activity type: {activity.get('type')}")
+
+    # --- ELSE block for incorrect Content-Type ---
+    else:
+        # Log the actual header received for debugging
+        actual_content_type = request.headers.get("Content-Type", "Not Set")
+        logger.warning(f"Received request with unsupported Content-Type or missing JSON body. Mimetype: '{request.mimetype}', Header: '{actual_content_type}'")
+        return jsonify({"error": "Unsupported Media Type - Expected 'application/json'"}), 415
+
+    # Default response if no other action taken (e.g., non-message activity ignored)
+    return jsonify({}), 200
+
+
+# --- Application Initialization ---
+# Simplified: Checks removed from module level.
+# Rely on environment variable checks during function calls (e.g., get_auth_token)
+# And potentially add a '/health' or '/status' endpoint for manual checks if needed.
+logger.info("Flask app object created.")
+
+
+# Make Flask app compatible with ASGI servers like Uvicorn/Hypercorn (used by Render often)
+asgi_app = WsgiToAsgi(app)
+
+if __name__ == "__main__":
+    # This block runs when executing the script directly (e.g., python app.py)
+    # Not typically used when deploying with Gunicorn/Uvicorn via Procfile/start command
+    import uvicorn
+    port = int(os.getenv("PORT", 5000)) # Use PORT env var provided by Render/hosting
+    logger.info(f"Starting development server directly using Uvicorn on port {port}")
+    # Point Uvicorn to the Flask app instance directly for local dev
+    uvicorn.run(app, host="0.0.0.0", port=port)
+
+# --- wsgi.py or Procfile content (for Render deployment) ---
+# wsgi.py should be simple:
+# from app import app as application
+#
+# Your Render Procfile or Start Command would be something like:
+# web: gunicorn wsgi:application --log-level info
+# Or using uvicorn worker for ASGI app (requires asgiref):
+# web: gunicorn -k uvicorn.workers.UvicornWorker app:asgi_app --log-level info

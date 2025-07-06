@@ -1,0 +1,11 @@
+flask
+gunicorn
+uvicorn
+python-dotenv
+requests
+urllib3
+langchain-google-genai
+cryptography
+pyjwt
+asgiref
+google-generativeai

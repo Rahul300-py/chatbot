@@ -1,0 +1,81 @@
+{
+    "$schema": "https://developer.microsoft.com/en-us/json-schemas/teams/v1.16/MicrosoftTeams.schema.json",
+    "manifestVersion": "1.16",
+    "version": "1.0.1",
+    "id": "a7e48570-4fcd-4d8e-a2da-6b93aeb4075a",
+    "packageName": "com.example.supportchatbot",
+    "developer": {
+        "name": "Ticketron T1x ",
+        "websiteUrl": "https://ticketnator-2.onrender.com",
+        "privacyUrl": "https://ticketnator-2.onrender.com/privacy",
+        "termsOfUseUrl": "https://ticketnator-2.onrender.com/terms"
+    },
+    "name": {
+        "short": "Support Chatbot",
+        "full": "Support Chatbot for Ticket Management"
+    },
+    "description": {
+        "short": "Easily manage support tickets within Teams.",
+        "full": "A chatbot to raise support tickets directly from Microsoft Teams and integrate with Jira."
+    },
+    "icons": {
+        "color": "icon-color.png",
+        "outline": "icon-outline.png"
+    },
+    "accentColor": "#FFFFFF",
+    "bots": [
+        {
+            "botId": "a7e48570-4fcd-4d8e-a2da-6b93aeb4075a",
+            "scopes": ["personal", "team", "groupchat"],
+            "supportsFiles": false,
+            "isNotificationOnly": false,
+            "botUrl": "https://ticketnator-2.onrender.com/api/messages",
+            "commandLists": [
+                {
+                    "scopes": ["personal"],
+                    "commands": [
+                        {
+                            "title": "Hi",
+                            "description": "Say hello to the bot"
+                        },
+                        {
+                            "title": "Help",
+                            "description": "Show available commands"
+                        },
+                        {
+                            "title": "Create Ticket",
+                            "description": "Create a new support ticket."
+                        },
+                        {
+                            "title": "Check Status",
+                            "description": "Check the status of an existing ticket."
+                        }
+                    ]
+                },
+                {
+                    "scopes": ["team", "groupchat"],
+                    "commands": [
+                        {
+                            "title": "@Bot Hi",
+                            "description": "@mention the bot to say hello"
+                        },
+                        {
+                            "title": "@Bot Help",
+                            "description": "@mention the bot to show available commands"
+                        },
+                        {
+                            "title": "@Bot Create Ticket <description>",
+                            "description": "@mention the bot to create a new ticket with a description"
+                        },
+                        {
+                            "title": "@Bot Check Status",
+                            "description": "@mention the bot to check ticket status"
+                        }
+                    ]
+                }
+            ]
+        }
+    ],
+    "permissions": ["identity", "messageTeamMembers"],
+    "devicePermissions": []
+}
